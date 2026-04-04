@@ -1,0 +1,5 @@
+Enabled: yes
+Types: deb
+URIs: https://artifacts.opensearch.org/releases/bundle/opensearch/3.x/apt
+Components: stable main
+Signed-By: /etc/apt/keyrings/opensearch-3.x.gpg

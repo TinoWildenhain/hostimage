@@ -1,0 +1,7 @@
+Enabled: yes
+Types: deb
+URIs: https://repo.mongodb.org/apt/ubuntu
+Suites: noble/mongodb-org/8.0
+Components: multiverse
+Architectures: amd64,arm64
+Signed-By: /etc/apt/keyrings/mongodb-org-8.0.gpg

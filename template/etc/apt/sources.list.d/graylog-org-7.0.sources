@@ -1,0 +1,6 @@
+Enabled: yes
+Types: deb
+URIs: https://downloads.graylog.org/repo/debian/
+Suites: stable
+Components: 7.0
+Signed-By: /etc/apt/keyrings/graylog-org-7.0.gpg

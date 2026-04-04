@@ -1,0 +1,6 @@
+Enabled: yes
+Types: deb
+URIs: https://artifacts.elastic.co/packages/9.x/apt
+Suites: stable
+Components: main
+Signed-By: /etc/apt/keyrings/elastic-9.x.gpg
