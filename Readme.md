@@ -1,29 +1,39 @@
 # VM Image Builder
 
-This project provides a Makefile-driven, modular VM image builder for Ubuntu that creates a debootstrapped system root, split disks (system, data) and exports to both VMware OVA and a KVM/libvirt test VM.
+This project provides a Makefile-driven, modular VM image builder for Ubuntu that creates a debootstrapped system root, three disk images (system, swap, data) and exports to both a VMware OVA and a KVM/libvirt test VM.
 
 ## Overview
 
 The build pipeline is composed of numbered shell scripts in `lib/`, orchestrated by a single `Makefile`. A configuration file in `conf/` defines host-specific settings such as hostname, OS release, disk sizes, network configuration, and user credentials. The pipeline is designed to be incrementally rebuildable: configuration changes only invalidate the stages that actually depend on them.
 
+## Design Philosophy
+
+The architecture separates concerns across three disk images with very different lifecycles:
+
+- **`systemroot.raw`** — the immutable system image. It is mounted read-only (`/`) at runtime. Because it carries no persistent state, it can be replaced wholesale on every deployment without touching user data. `/tmp` is backed by a tmpfs.
+- **`swap.raw`** — a throwaway disk. It is recreated on every build so that its UUID is known at image-build time and can be written into the system image's `/etc/fstab`. Since swap holds no durable state, recreating it is safe and cheap.
+- **`data.raw`** — the one disk that matters operationally. Created once and preserved across all subsequent builds and deployments. It backs `/var` and `/home` via LVM and is the **only disk that needs to be backed up** in production.
+
+To reconcile the read-only system image with the live `/var` on the data disk, a **first-boot sync** service runs early in the boot sequence. It unpacks a `pristine-var.tgz` tarball (embedded in the system image at build time) into the live `/var`, using `--keep-newer-files` so it only fills in missing entries or overwrites files that are older. Paths such as live database directories (e.g. PostgreSQL data) are explicitly excluded from overwrite.
+
 ## Features
 
 - **Split Disk Architecture**
-  - `systemroot.raw`: bootable, mostly immutable system disk, containing an EFI system partition and an LVM root filesystem.
-  - `data.raw`: persistent data disk backed by LVM, carrying `/var`, `/home`, and swap.
+  - `systemroot.raw`: read-only system disk with EFI system partition and LVM root filesystem.
+  - `swap.raw`: dedicated swap disk; recreated each build to keep its UUID in sync with fstab.
+  - `data.raw`: persistent data disk (LVM `/var` + `/home`); created once, preserved and backed up.
 - **Smart Incremental Builds**
   - Tracks `OS_RELEASE` and `EXTRA_PACKAGES` via a cached config file in `build/<hostname>/.config.cache`.
   - Automatically invalidates only the stages that need rebuilding when config changes are detected.
-- **Persistent Data Disk**
-  - `data.raw` is not overwritten by default, so `/var` and `/home` contents survive repeated builds.
-  - A separate `make dataclean` target is provided to explicitly rebuild the data disk.
 - **First-Boot Sync**
-  - A systemd oneshot service and helper script synchronize selected system files in `/var` from the base image into the persistent data disk on first boot.
-  - Critical paths such as live PostgreSQL data directories are excluded from overwrites.
+  - A systemd oneshot service (`sync-var-home.service`) runs before `network-pre.target`.
+  - It unpacks `/usr/local/share/pristine-var.tgz` into `/var` with `--keep-newer-files`, refreshing package-installed state without overwriting live data.
+  - Explicitly excludes critical paths (e.g. `./lib/postgresql`) from any overwrite.
 - **Extra APT Repositories**
   - `35-repositories.sh` supports adding third-party APT repositories (e.g. PostgreSQL PGDG) before package installation, driven by `EXTRA_REPOSITORIES` in the config.
 - **Multi-Hypervisor Support**
   - Generates a VMware-compatible OVA (`.ova`) with streamOptimized VMDKs and an OVF descriptor.
+  - OVA always includes `system-root.vmdk` and `swap.vmdk`; `data-persistent.vmdk` is included only when the data disk was freshly built in the same run.
   - Provides a `make test` path that spins up a KVM/libvirt VM using qcow2 images and an automatically defined NAT network.
 - **Multi-Config Support**
   - Multiple host configurations can be placed in `conf/`.
@@ -47,8 +57,8 @@ The build pipeline is composed of numbered shell scripts in `lib/`, orchestrated
 │   ├── 40-packages.sh          # Kernel, guest tools, extra packages
 │   ├── 50-configure.sh         # Placeholder for config management
 │   ├── 60-bootable.sh          # initramfs / GRUB config inside chroot
-│   ├── 70-create-systemroot-image.sh
-│   ├── 72-create-data-image.sh # Data disk (includes swap LV)
+│   ├── 70-create-systemroot-image.sh  # System disk + swap.raw + fstab
+│   ├── 72-create-data-image.sh        # Data disk (/var + /home LVs)
 │   ├── 80-create-ova.sh        # VMware OVF + OVA packaging
 │   └── 90-test-vm.sh           # KVM/libvirt test VM creation
 └── build/                      # Output directory (created by Make)
@@ -79,16 +89,23 @@ DISK_SIZE_GB=20
 VG_NAME="${HOSTNAME}-vgsys"
 LV_ROOT_SIZE_GB=16
 
-# --- Data disk (persistent: /var, /home, swap) ---
+# --- Swap disk ---
+# swap.raw is a separate, throwaway disk image created inside 70-create-systemroot-image.sh.
+# It is always recreated so its partition UUID can be embedded in fstab at image-build time.
+# No LVM; a single GPT linux-swap partition is initialized with mkswap.
+LV_SWAP_SIZE_GB=4
+
+# --- Data disk (/var + /home only; no swap) ---
+# Created once and preserved across deployments. This is the only disk to back up.
 DATA_DISK_SIZE_GB=40
 DATA_VG_NAME="${HOSTNAME}-vgdata"
 LV_VAR_NAME=var
 LV_VAR_SIZE_GB=10
 LV_HOME_NAME=home
 LV_HOME_SIZE_GB=20
-# Swap is now a logical volume on the data disk (no separate swap.raw)
-LV_SWAP_NAME=swap
-LV_SWAP_SIZE_GB=4
+# Optional: override filesystem type for /var and /home (default: ext4)
+# FS_VAR_TYPE=ext4    # ext4, xfs, or btrfs
+# FS_HOME_TYPE=ext4
 
 # --- Network ---
 NETWORK_IFACE=eth0
@@ -158,19 +175,19 @@ INSTALL_KVM_TOOLS=true
 | `NETWORK_DNS` | ✗ | Space-separated DNS server list |
 | `NET_NAME` | ✗ | libvirt and OVF network name; defaults to `${HOSTNAME}-net` |
 
-#### Disk and LVM layout
+#### Disk layout
 
 | Variable | Required | Description |
 |---|---|---|
-| `DISK_SIZE_GB` | ✔ | Size of `systemroot.raw` |
-| `VG_NAME` | ✔ | Volume group name for the root LV on the system disk |
-| `LV_ROOT_SIZE_GB` | ✔ | Size of the root LV on the system disk |
-| `DATA_DISK_SIZE_GB` | ✔ | Size of `data.raw` |
-| `DATA_VG_NAME` | ✔ | Volume group name for the data disk |
-| `LV_VAR_NAME` / `LV_HOME_NAME` | ✔ | LV names for `/var` and `/home` |
+| `DISK_SIZE_GB` | ✔ | Total size of `systemroot.raw` |
+| `VG_NAME` | ✔ | Volume group name on the system disk |
+| `LV_ROOT_SIZE_GB` | ✔ | Root LV size on the system disk |
+| `LV_SWAP_SIZE_GB` | ✔ | Size of `swap.raw` (single GPT linux-swap partition, no LVM) |
+| `DATA_DISK_SIZE_GB` | ✔ | Total size of `data.raw` |
+| `DATA_VG_NAME` | ✔ | Volume group name on the data disk |
+| `LV_VAR_NAME` / `LV_HOME_NAME` | ✔ | LV names for `/var` and `/home` on the data disk |
 | `LV_VAR_SIZE_GB` / `LV_HOME_SIZE_GB` | ✔ | Sizes for the above LVs |
-| `LV_SWAP_NAME` | ✔ | LV name for the swap volume on the data disk |
-| `LV_SWAP_SIZE_GB` | ✔ | Size of the swap LV on the data disk |
+| `FS_VAR_TYPE` / `FS_HOME_TYPE` | ✗ | Filesystem type for `/var` / `/home`; `ext4` (default), `xfs`, or `btrfs` |
 
 #### Packages and repositories
 
@@ -218,11 +235,12 @@ Ensures `sudo` is installed in the chroot, creates the primary user (if missing)
 
 Applies system-level configuration inside the chroot:
 
-- SSH hardening: disables root login and password authentication, configures a minimal `sshd_config`.
-- Interface naming: installs a `.link` file to force the primary interface to be named `eth0`.
-- Network configuration: creates a `.network` file for `systemd-networkd` based on the configured address/gateway (static) or DHCP, then enables `systemd-networkd`.
-- First-boot sync: installs `/usr/local/sbin/sync-var-home.sh` and a corresponding `sync-var-home.service` unit, which refreshes `/var` from a pristine tarball on boot while preserving selected paths.
-- Writes a basic `/etc/hosts` to the chroot.
+- **SSH hardening**: disables root login and password authentication, configures a minimal `sshd_config`.
+- **Interface naming**: installs a `.link` file to force the primary interface to be named `eth0`.
+- **Network**: creates a `.network` file for `systemd-networkd` — either DHCP or static address/gateway/DNS — and enables `systemd-networkd` and `systemd-resolved`.
+- **tmpfs for `/tmp`**: enables `tmp.mount` (required for read-only root operation).
+- **First-boot sync**: installs `/usr/local/sbin/sync-var-home.sh` and `sync-var-home.service`. On first boot after a new image is deployed, the service unpacks `/usr/local/share/pristine-var.tgz` into the live `/var` using `--keep-newer-files`, filling in any missing package-installed state without overwriting existing data. Paths such as `./lib/postgresql` are explicitly excluded.
+- **`/etc/hosts`**: writes a basic hosts file with the configured hostname.
 
 ### Stage 3a: repositories
 
@@ -230,7 +248,7 @@ Applies system-level configuration inside the chroot:
 - **Target**: `systemroot/.stage_repositories`
 - **Invocation**: `make repositories`
 
-Adds any third-party APT repositories listed in `EXTRA_REPOSITORIES` into the chroot before the package installation stage. Each token in the list maps to a known repository definition (GPG key, sources list entry). Currently the following tokens are supported:
+Adds any third-party APT repositories listed in `EXTRA_REPOSITORIES` into the chroot before package installation. Each token in the list maps to a known repository definition (GPG key + sources entry). Currently supported tokens:
 
 - `postgresql` — adds the official PGDG apt repository for the configured OS release.
 
@@ -269,47 +287,55 @@ Prepares the chroot for later EFI bootloader installation:
 - Adjusts `/etc/default/grub` to enable serial and VGA consoles and verbose systemd logging.
 - Runs `update-initramfs` and `update-grub` inside the chroot.
 
-The actual `grub-install` into a disk image is performed later by the systemroot image creation stage.
+The actual `grub-install` into the disk image is performed in the next stage.
 
 ## Image Creation
 
-The `images` target builds two raw disk images under `build/<hostname>/images`:
+The `images` target builds three raw disk images under `build/<hostname>/images`:
 
-- `systemroot.raw`: bootable system disk.
-- `data.raw`: persistent data disk (includes `/var`, `/home`, and swap LV).
+- `systemroot.raw`: bootable, read-only system disk.
+- `swap.raw`: throwaway swap disk (no LVM; single GPT linux-swap partition).
+- `data.raw`: persistent data disk with LVM `/var` and `/home`.
 
-### Systemroot disk
+### Systemroot and swap disk
 
 - **Script**: `lib/70-create-systemroot-image.sh`
 - **Target**: `build/<hostname>/images/systemroot.raw`
 
-Creates the primary system disk:
+This script creates both the system disk and the swap disk in a single pass, so the swap partition UUID is known and can be embedded in fstab before the script exits.
 
-- Allocates a raw file of size `DISK_SIZE_GB` and attaches it as a loop device.
-- Partitions it with GPT, creating an EFI system partition and an LVM PV partition.
-- Initializes an LVM VG and root LV of size `LV_ROOT_SIZE_GB`.
-- Formats the ESP as FAT32 and the root LV as ext4.
-- Mounts the root LV and ESP and copies the chroot contents into the mounted root (excluding any existing EFI files).
-- Ensures `/var` and `/home` in the image are empty directories intended to be mount points for the data disk.
-- Generates `/etc/fstab` in the image, using `UUID=` entries for root, ESP, `/var`, `/home`, and swap.
-- Configures GRUB in the image by creating a device map, running `grub-install` for EFI, and adding a fallback `BOOTX64.EFI` if needed.
-- Runs `update-grub` inside the image chroot.
-- Writes a marker file `/var/.image_version` inside the image that encodes the build version and metadata.
+**System disk:**
+- Allocates a raw file of `DISK_SIZE_GB` and attaches it as a loop device.
+- Partitions with GPT: an EFI system partition and an LVM PV partition.
+- Creates LVM VG + root LV; formats ESP as FAT32, root as ext4.
+- Copies the chroot into the image root (excluding EFI contents) via `rsync`.
+- Empties `/var` and `/home` in the image — these are mount points only; content lives on the data disk.
+- Generates `/etc/fstab` with `UUID=` entries for root, ESP, `/var`, `/home`, and swap.
+- Runs `grub-install` (EFI) and `update-grub` inside the image chroot.
+- Writes `/var/.image_version` as a build metadata marker used by the first-boot sync service and the OVA export logic.
+
+**Swap disk (created in the same script):**
+- Allocates a raw file of `LV_SWAP_SIZE_GB`, attaches it as a second loop device.
+- Partitions with GPT and a single linux-swap partition; initializes with `mkswap`.
+- The resulting partition UUID is appended to the fstab of the system disk image before the image is finalized.
+- `swap.raw` is always recreated (it carries no persistent data); only its UUID matters.
 
 ### Data disk
 
 - **Script**: `lib/72-create-data-image.sh`
 - **Target**: `build/<hostname>/images/data.raw`
 
-The data disk hosts persistent `/var`, `/home`, and swap:
+The data disk is the single source of persistent state. It holds `/var` and `/home` and is **only created if it does not already exist**, preserving data across subsequent builds.
 
-- Allocates a raw file of size `DATA_DISK_SIZE_GB`, attaches it as a loop device.
-- Creates a single GPT partition, converts it into an LVM PV, and builds a data VG and LVs for `/var`, `/home`, and swap.
-- Formats the `/var` and `/home` LVs as ext4; initializes the swap LV with `mkswap`.
-- Mounts `/var` and `/home` and populates them from the systemroot chroot using `rsync`.
-- Creates an `/var/.image_version` marker on the data disk for the first-boot sync logic.
+- Allocates a raw file of `DATA_DISK_SIZE_GB`, attaches it as a loop device.
+- Creates a single GPT partition, converts it into an LVM PV, and builds a VG with two LVs: one for `/var` and one for `/home`.
+- Formats both LVs (ext4 by default; xfs and btrfs are also supported via `FS_VAR_TYPE` / `FS_HOME_TYPE`).
+- Populates `/var` and `/home` from the systemroot chroot using `rsync`.
+- Writes `/var/.image_version` as the trigger file for the first-boot sync service.
 
-By default, `data.raw` is only created if it does not already exist, so subsequent `make images` runs preserve existing data. Use `make dataclean` to force recreation.
+Use `make dataclean` to explicitly discard and recreate the data disk.
+
+> **Operational note**: `data.raw` is the only disk image that needs to be backed up in production. `systemroot.raw` and `swap.raw` are fully reproducible from the build pipeline.
 
 ## OVA Export
 
@@ -319,11 +345,11 @@ By default, `data.raw` is only created if it does not already exist, so subseque
 
 Produces a VMware-compatible OVA:
 
-- Converts `systemroot.raw` to a streamOptimized VMDK.
-- Optionally converts `data.raw` to `data-persistent.vmdk` if a fresh image build marker is present.
-- Constructs an OVF descriptor with VM hardware (CPU, memory), virtual disks, and network configuration.
-- Packages the OVF and VMDKs into a single `.ova` tarball.
-- Clears the image-version stamp used to decide whether to re-export the data disk on subsequent runs.
+- Converts `systemroot.raw` → `system-root.vmdk` and `swap.raw` → `swap.vmdk` (streamOptimized format); skips conversion if the VMDK is already up to date.
+- Converts `data.raw` → `data-persistent.vmdk` **only** when the data disk was freshly built in the current run (indicated by the `build/<hostname>/.image_version` stamp). This prevents accidentally overwriting the production data disk VMDK on subsequent system-only rebuilds.
+- Generates an OVF descriptor referencing all included VMDKs, EFI firmware hints, and the configured CPU/memory/network.
+- Packages everything into a single `.ova` tarball.
+- Removes the `.image_version` stamp so subsequent `make vmware` calls without a new image build do not re-export the data disk.
 
 ## KVM/Libvirt Test VM
 
@@ -332,9 +358,9 @@ Produces a VMware-compatible OVA:
 
 Spins up a local KVM/libvirt VM using the generated images:
 
-- Converts the two `.raw` images into `.qcow2` files under `/var/lib/libvirt/images/<hostname>-test`.
+- Converts `systemroot.raw` and `data.raw` to qcow2 under `/var/lib/libvirt/images/<hostname>-test`.
 - Defines (if needed) and starts a libvirt NAT network using the configured gateway, CIDR and DHCP range.
-- Creates a guest with virtio disks, virtio network interface, EFI firmware (Secure Boot disabled), and the configured CPU and memory.
+- Creates a guest with virtio disks, virtio network, EFI firmware (Secure Boot disabled), and the configured CPU and memory.
 - Starts the VM and attaches a serial console for interactive testing.
 
 ## Usage
@@ -349,7 +375,7 @@ This will:
 
 - Run config change detection and update the config cache.
 - Execute all stages up to and including image creation.
-- Produce `systemroot.raw` and `data.raw` under `build/<hostname>/images`.
+- Produce `systemroot.raw`, `swap.raw`, and `data.raw` under `build/<hostname>/images`.
 
 ### Build OVA
 
@@ -357,7 +383,7 @@ This will:
 make vmware CONFIG=conf/myvm.conf
 ```
 
-Requires that the image stage has completed. Produces `build/<hostname>/vmware/<hostname>.ova`.
+Requires that the image stage has completed. Produces `build/<hostname>/vmware/<hostname>.ova` containing `system-root.vmdk`, `swap.vmdk`, and (if freshly built) `data-persistent.vmdk`.
 
 ### Run in KVM/libvirt
 
@@ -378,10 +404,10 @@ Iterates over all `conf/*.conf` and runs `make images` for each config.
 ## Cleaning
 
 - `make clean CONFIG=conf/myvm.conf`
-  - Removes the chroot (`systemroot/`), the system raw image, OVA and VMDKs, and the config cache for that host.
+  - Removes the chroot (`systemroot/`), `systemroot.raw`, `swap.raw`, OVA and VMDKs, and the config cache for that host.
   - Leaves `data.raw` intact.
 - `make dataclean CONFIG=conf/myvm.conf`
-  - Removes `data.raw` only.
+  - Removes `data.raw` only, forcing a full data disk rebuild on the next `make images`.
 - `make distclean CONFIG=conf/myvm.conf`
   - Removes the entire `build/<hostname>` directory for that host.
 - `make clean-all`
@@ -392,10 +418,10 @@ Iterates over all `conf/*.conf` and runs `make images` for each config.
 The numbered scripts are intentionally modular and small. Suggested extension points include:
 
 - Enhancing `50-configure.sh` to pull configuration from git or another source of truth.
-- Adding additional service configuration to `30-systemconfig.sh` (e.g., enabling monitoring agents).
+- Adding additional service configuration to `30-systemconfig.sh` (e.g. monitoring agents, additional systemd units).
 - Adding new repository definitions to `35-repositories.sh` by extending the `EXTRA_REPOSITORIES` token list.
 - Extending the OVA generator to support additional virtual hardware or metadata fields.
-- Adding new stages (e.g., for application deployment) with corresponding Makefile targets and stamp files.
+- Adding new stages (e.g. for application deployment) with corresponding Makefile targets and stamp files.
 
 ## Requirements
 
